@@ -1,199 +1,188 @@
-"""
-LeapHandTracker
-- Requires Leap/Ultraleap Python bindings available as `Leap` (common in Leap SDK installs).
-- Keeps a live copy of the latest frame and provides get_hands() to fetch structured hand data.
+from __future__ import annotations
 
-Position units: millimeters (Leap native).
-"""
+from dataclasses import dataclass
+from typing import Dict, Optional, Literal
 
-import time
-import threading
-
-# try common module names used in examples
-try:
-    import Leap                    # legacy Leap Python bindings
-except Exception as e:
-    raise ImportError(
-        "Could not import Leap module. Install the Ultraleap/Leap Python SDK or "
-        "ensure your Python interpreter can import the Leap library. See Ultraleap docs."
-    ) from e
+from leapc_cffi import libleapc as LeapC, ffi
 
 
-class _FrameListener(Leap.Listener):
-    def __init__(self):
-        super().__init__()
-        self._lock = threading.Lock()
-        self.latest_frame = None
-        self.connected = False
-
-    def on_connect(self, controller):
-        self.connected = True
-        # enable gestures if you want them:
-        # controller.enable_gesture(Leap.Gesture.TYPE_SWIPE)
-        print("[Leap] Connected")
-
-    def on_disconnect(self, controller):
-        self.connected = False
-        print("[Leap] Disconnected")
-
-    def on_frame(self, controller):
-        frame = controller.frame()
-        with self._lock:
-            # copy the frame reference (Leap frames are lightweight objects)
-            self.latest_frame = frame
-
-    def get_frame(self):
-        with self._lock:
-            return self.latest_frame
+HandType = Literal["left", "right"]
+FingerName = Literal["thumb", "index", "middle", "ring", "pinky"]
 
 
-def _vec_to_tuple(v):
-    """Convert Leap.Vector to (x,y,z) tuple. Accepts plain Python sequences too."""
-    try:
-        return (float(v.x), float(v.y), float(v.z))
-    except Exception:
-        # if v is already tuple/list
-        return tuple(map(float, v))
+@dataclass
+class Vec3:
+    x: float
+    y: float
+    z: float
 
 
-class LeapHandTracker:
+@dataclass
+class HandData:
+    hand_type: HandType
+    palm: Vec3
+    fingers: Dict[FingerName, Vec3]
+
+
+@dataclass
+class FrameData:
+    hands: Dict[HandType, HandData]
+
+
+class LeapController:
     """
-    High-level tracker class.
-
-    Usage:
-        tracker = LeapHandTracker()
-        tracker.start()
-        time.sleep(0.5)  # give it a moment to gather frames
-        hands = tracker.get_hands()
-        tracker.stop()
+    Thin wrapper around LeapC that:
+      - Manages connection lifecycle
+      - Polls tracking events
+      - Exposes palm + 5 fingertip positions for both hands
     """
 
-    BONE_NAMES = {
-        Leap.Bone.TYPE_METACARPAL: "metacarpal",
-        Leap.Bone.TYPE_PROXIMAL: "proximal",
-        Leap.Bone.TYPE_INTERMEDIATE: "intermediate",
-        Leap.Bone.TYPE_DISTAL: "distal",
-    }
+    def __init__(self) -> None:
+        # Allocate connection pointer and create/open connection
+        self._conn_ptr = ffi.new("LEAP_CONNECTION*")
+        result = LeapC.LeapCreateConnection(ffi.NULL, self._conn_ptr)
+        if result != LeapC.eLeapRS_Success:
+            raise RuntimeError(f"LeapCreateConnection failed with code {int(result)}")
 
-    def __init__(self, auto_start=False):
-        self._controller = Leap.Controller()
-        self._listener = _FrameListener()
-        self._started = False
-        if auto_start:
-            self.start()
+        result = LeapC.LeapOpenConnection(self._conn_ptr[0])
+        if result != LeapC.eLeapRS_Success:
+            raise RuntimeError(f"LeapOpenConnection failed with code {int(result)}")
 
-    def start(self):
-        if not self._started:
-            self._controller.add_listener(self._listener)
-            self._started = True
-            # wait a short while for initial frames
-            t0 = time.time()
-            while time.time() - t0 < 1.0:
-                if self._listener.get_frame() is not None:
-                    break
-                time.sleep(0.01)
+        # Allocate a single message struct and set its size before polling
+        self._msg = ffi.new("LEAP_CONNECTION_MESSAGE *")
+        self._msg[0].size = ffi.sizeof("LEAP_CONNECTION_MESSAGE")
 
-    def stop(self):
-        if self._started:
-            self._controller.remove_listener(self._listener)
-            self._started = False
+    # --- lifecycle ---------------------------------------------------------
 
-    def get_hands(self):
+    def close(self) -> None:
+        if self._conn_ptr is not None:
+            LeapC.LeapCloseConnection(self._conn_ptr[0])
+            self._conn_ptr = None
+
+    def __enter__(self) -> "LeapController":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    # --- public API --------------------------------------------------------
+
+    def poll_frame(self, timeout_ms: int = 1000) -> Optional[FrameData]:
         """
-        Returns a dict keyed by hand.id. Each value is:
-        {
-            'id': hand.id,
-            'type': 'left'/'right',
-            'palm_pos': (x,y,z),
-            'palm_normal': (x,y,z),
-            'palm_direction': (x,y,z),
-            'grab_strength': float,
-            'pinch_strength': float,
-            'fingers': [
-                {
-                    'id': finger.id,
-                    'type': finger.type,  # 0..4 (thumb..pinky) per API
-                    'tip': (x,y,z),
-                    'bones': {
-                        'metacarpal': {'prev_joint':(), 'next_joint':(), 'center':()},
-                        'proximal': {...},
-                        ...
-                    }
-                }, ...
-            ]
-        }
+        Polls the Leap service once.
+
+        Returns:
+            FrameData if a tracking event is received within timeout,
+            otherwise None (on timeout or non-tracking events).
         """
-        frame = self._listener.get_frame()
+        result = LeapC.LeapPollConnection(self._conn_ptr[0], timeout_ms, self._msg)
+
+        if result == LeapC.eLeapRS_Timeout:
+            return None
+        if result != LeapC.eLeapRS_Success:
+            # You can choose to raise instead if you want strict behavior
+            return None
+
+        evt_type = self._msg[0].type
+
+        if evt_type == LeapC.eLeapEventType_Tracking:
+            tracking_evt = self._msg[0].tracking_event[0]
+            return self._parse_tracking_event(tracking_evt)
+
+        # Ignore non-tracking events for this wrapper
+        return None
+
+    # --- helpers -----------------------------------------------------------
+
+    def _parse_tracking_event(self, evt) -> FrameData:
+        hands: Dict[HandType, HandData] = {}
+
+        for i in range(evt.nHands):
+            hand = evt.pHands[i]
+            hand_type: HandType = (
+                "left" if hand.type == LeapC.eLeapHandType_Left else "right"
+            )
+
+            palm_pos = hand.palm.position
+            palm = Vec3(float(palm_pos.x), float(palm_pos.y), float(palm_pos.z))
+
+            # Fingertips: distal.next_joint for each finger
+            # Field names follow LeapC hand struct: thumb, index, middle, ring, pinky
+            fingers: Dict[FingerName, Vec3] = {}
+
+            def fingertip(joint) -> Vec3:
+                return Vec3(float(joint.x), float(joint.y), float(joint.z))
+
+            fingers["thumb"] = fingertip(hand.thumb.distal.next_joint)
+            fingers["index"] = fingertip(hand.index.distal.next_joint)
+            fingers["middle"] = fingertip(hand.middle.distal.next_joint)
+            fingers["ring"] = fingertip(hand.ring.distal.next_joint)
+            fingers["pinky"] = fingertip(hand.pinky.distal.next_joint)
+
+            hands[hand_type] = HandData(
+                hand_type=hand_type,
+                palm=palm,
+                fingers=fingers,
+            )
+
+        return FrameData(hands=hands)
+
+    # --- convenience accessors --------------------------------------------
+
+    def get_hand(self, hand_type: HandType, timeout_ms: int = 1000) -> Optional[HandData]:
+        """
+        Polls once and returns the requested hand if present.
+        """
+        frame = self.poll_frame(timeout_ms=timeout_ms)
         if frame is None:
-            return {}
+            return None
+        return frame.hands.get(hand_type)
 
-        hands_out = {}
-        for hand in frame.hands:
-            hand_dict = {
-                "id": hand.id,
-                "type": "left" if hand.is_left else "right",
-                "palm_pos": _vec_to_tuple(hand.palm_position),
-                "palm_normal": _vec_to_tuple(hand.palm_normal),
-                "palm_direction": _vec_to_tuple(hand.direction),
-                "grab_strength": float(hand.grab_strength),
-                "pinch_strength": float(getattr(hand, "pinch_strength", 0.0)),
-                "fingers": []
-            }
+    def get_palm_position(
+        self, hand_type: HandType, timeout_ms: int = 1000
+    ) -> Optional[Vec3]:
+        """
+        Returns palm position for the requested hand, or None if not available.
+        """
+        hand = self.get_hand(hand_type, timeout_ms=timeout_ms)
+        return hand.palm if hand else None
 
-            # iterate fingers
-            for finger in hand.fingers:
-                finger_dict = {
-                    "id": finger.id,
-                    "type": int(finger.type),  # 0 thumb ... 4 pinky
-                    "tip": _vec_to_tuple(finger.tip_position),
-                    "bones": {}
-                }
-
-                # Leap finger.bone(bone_type) for TYPE_METACARPAL .. TYPE_DISTAL
-                for bone_type in (Leap.Bone.TYPE_METACARPAL,
-                                  Leap.Bone.TYPE_PROXIMAL,
-                                  Leap.Bone.TYPE_INTERMEDIATE,
-                                  Leap.Bone.TYPE_DISTAL):
-                    bone = finger.bone(bone_type)
-                    name = self.BONE_NAMES.get(bone_type, str(bone_type))
-                    prev_j = _vec_to_tuple(bone.prev_joint)
-                    next_j = _vec_to_tuple(bone.next_joint)
-                    # bone center as midpoint
-                    center = tuple((a + b) / 2.0 for a, b in zip(prev_j, next_j))
-                    finger_dict["bones"][name] = {
-                        "prev_joint": prev_j,
-                        "next_joint": next_j,
-                        "center": center,
-                        "length": float(bone.length) if hasattr(bone, "length") else None
-                    }
-
-                hand_dict["fingers"].append(finger_dict)
-
-            hands_out[hand.id] = hand_dict
-
-        return hands_out
+    def get_finger_position(
+        self,
+        hand_type: HandType,
+        finger: FingerName,
+        timeout_ms: int = 1000,
+    ) -> Optional[Vec3]:
+        """
+        Returns fingertip position for a given hand and finger, or None if not available.
+        """
+        hand = self.get_hand(hand_type, timeout_ms=timeout_ms)
+        if not hand:
+            return None
+        return hand.fingers.get(finger)
 
 
+# ---------------------------------------------------------------------------
 # Example usage
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    tracker = LeapHandTracker()
-    try:
-        tracker.start()
-        print("Listening... (press Ctrl+C to exit)")
+    import time
+
+    with LeapController() as lc:
+        print("Connection opened. Move your hands over the device...")
+
         while True:
-            hands = tracker.get_hands()
-            if hands:
-                for hid, h in hands.items():
-                    print(f"Hand {hid} ({h['type']}) palm at {h['palm_pos']}")
-                    for finger in h["fingers"]:
-                        print(f"  Finger {finger['type']} tip {finger['tip']}")
-                        # print joint centers
-                        for bname, bdata in finger["bones"].items():
-                            print(f"    {bname} center {bdata['center']}")
-            else:
-                print("No hands detected.")
-            time.sleep(0.08)  # ~12 Hz polling; frames arrive at ~100Hz, so we sample
-    except KeyboardInterrupt:
-        print("Stopping.")
-    finally:
-        tracker.stop()
+            frame = lc.poll_frame(timeout_ms=1000)
+            if frame is None:
+                continue
+
+            for hand_type, hand in frame.hands.items():
+                print(f"{hand_type.upper()} palm: ({hand.palm.x:.1f}, {hand.palm.y:.1f}, {hand.palm.z:.1f})")
+                for fname, fpos in hand.fingers.items():
+                    print(
+                        f"  {hand_type.upper()} {fname:6s}: "
+                        f"({fpos.x:.1f}, {fpos.y:.1f}, {fpos.z:.1f})"
+                    )
+
+            time.sleep(0.05)
