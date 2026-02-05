@@ -1,43 +1,30 @@
 # import leap
 from arduino import Arduino, Port
 import serial.tools.list_ports
-from .vector import Vector3
+from vector import Vector3
+from renderer import Cube, Sphere, Camera, Renderer3D
+import numpy as np
+import math
+
+sin, cos = math.sin, math.cos
 
 
-class Sphere:
-    def __init__(self, pos, radius):
-        self.pos = pos
-        self.radius = radius
-    
-    def getSignedDistance(self, point):
-        dist = ((point - self.pos).magnitude() - self.radius)
-        return dist
+if __name__ == "__main__":
+    # Toggle between Cube and Sphere
+    shape = Cube([0,0,0], 80)
+    # shape = Sphere([0,0,0], 80)
 
-def sign(x):
-    if x >= 0:
-        return 1
-    return -1
+    cam = Camera(distance=400, angle=0)
+    renderer = Renderer3D()
 
-class Cube:
-    def __init__(self, pos, radius):
-        self.pos = pos          # Vector3
-        self.radius = radius    # half-size of cube
+    def moving_point(t):
+        return np.array([
+            130 * cos(t * 0.03),
+            60 * sin(t * 0.05),
+            130 * sin(t * 0.03)
+        ])
 
-    def getSignedDistance(self, point):
-        # Vector from cube center to point
-        p = point - self.pos
-
-        # Distance from each face
-        q = Vector3(abs(p.x), abs(p.y), abs(p.z)) - Vector3(self.radius, self.radius, self.radius)
-
-        # Outside distance
-        outside = Vector3(max(q.x, 0), max(q.y, 0), max(q.z, 0)).magnitude()
-
-        # Inside distance (negative)
-        inside = min(max(q.x, max(q.y, q.z)), 0)
-
-        return outside + inside
-
+    renderer.render(shape, cam, moving_point)
 
 
 def distance2analog(distanceMM):
