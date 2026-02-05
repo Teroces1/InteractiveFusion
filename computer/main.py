@@ -20,21 +20,24 @@ def sign(x):
 
 class Cube:
     def __init__(self, pos, radius):
-        self.pos = pos
-        self.radius = radius
+        self.pos = pos          # Vector3
+        self.radius = radius    # half-size of cube
+
     def getSignedDistance(self, point):
-        distV = ((point - self.pos).magnitude())
+        # Vector from cube center to point
+        p = point - self.pos
 
-        if abs(distV.x) >= abs(distV.y) and abs(distV.x) >= abs(distV.z):
-            normal = Vector3(sign(distV.y), 0, 0)
-        elif abs(distV.z) >= abs(distV.y) and abs(distV.z) >= abs(distV.x)
-            normal = Vector3(0, 0, sign(distV.y))
-        else:
-            normal = Vector3(0, sign(distV.y), 0)
+        # Distance from each face
+        q = Vector3(abs(p.x), abs(p.y), abs(p.z)) - Vector3(self.radius, self.radius, self.radius)
 
-        dist = normal.dot(distV) * normal - self.radius
+        # Outside distance
+        outside = Vector3(max(q.x, 0), max(q.y, 0), max(q.z, 0)).magnitude()
 
-        return dist
+        # Inside distance (negative)
+        inside = min(max(q.x, max(q.y, q.z)), 0)
+
+        return outside + inside
+
 
 
 def distance2analog(distanceMM):
